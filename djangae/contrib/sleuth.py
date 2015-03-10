@@ -15,6 +15,9 @@
 #  with sleuth.switch("some.path.to.thing", lambda x: pass) as mock:
 #
 
+import time
+import functools
+
 def _dot_lookup(thing, comp, import_path):
     try:
         return getattr(thing, comp)
@@ -39,7 +42,17 @@ def _patch(path, replacement):
     )
     setattr(thing, path.split(".")[-1], replacement)
 
-class Watch(object):
+
+class ContextDecorator(object):
+    def __call__(self, func):
+        @functools.wraps(func)
+        def _wrapped(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+        return _wrapped
+
+
+class Watch(ContextDecorator):
     """
         A context manager that is used to watch a function for calls. It essentially decorates
         the function for the lifetime of the context and records all the calls made to it so that
@@ -59,11 +72,16 @@ class Watch(object):
                     (args, kwargs)
                 )
                 wrapped.called = True
-                return _func(*args, **kwargs)
+                wrapped.call_times.append(time.time())
+                ret_val = _func(*args, **kwargs)
+                wrapped.call_returns.append(ret_val)
+                return ret_val
 
             wrapped.call_count = 0
             wrapped.calls = []
             wrapped.called = False
+            wrapped.call_times = []
+            wrapped.call_returns = []
 
             return wrapped
 
@@ -80,7 +98,7 @@ class Watch(object):
 watch = Watch
 
 
-class Switch(object):
+class Switch(ContextDecorator):
     """
         Replaces a function specified by a path, with the passed callable. The passed in callable is
         wrapped using the above Watch context manager so that you can also assert that your replacement is
@@ -102,3 +120,26 @@ class Switch(object):
         _patch(self._func_path, self._original_func)
 
 switch = Switch
+
+class Detonate(Switch):
+    def __init__(self, func_path, exception=None):
+        self._exception = exception or Exception
+
+        def throw(*args, **kwargs):
+            if callable(self._exception):
+                raise self._exception("Detonated %s" % func_path)
+            else:
+                raise self._exception
+
+        super(Detonate, self).__init__(func_path, throw)
+
+detonate = Detonate
+
+class Fake(Switch):
+    def __init__(self, func_path, return_value):
+        def replacement(*args, **kwargs):
+            return return_value
+
+        super(Fake, self).__init__(func_path, replacement)
+
+fake = Fake

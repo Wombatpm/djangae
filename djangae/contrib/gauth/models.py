@@ -1,5 +1,6 @@
 import re
 
+from django.utils.functional import lazy
 from django.contrib import auth
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import (
@@ -11,17 +12,18 @@ from django.contrib.auth.models import (
     _user_has_perm,
     _user_has_module_perms,
     urlquote,
+    PermissionsMixin as DjangoPermissionsMixin,
 )
 from django.core.mail import send_mail
 from django.core import validators
 from django.db import models
 from django.db.models import signals
-from django.utils import timezone
+from django.utils import timezone, six
 from django.utils.translation import ugettext_lazy as _
 from django.db.models.loading import get_apps, get_models
 from django.contrib.auth import get_permission_codename
 
-from djangae.fields import ListField
+from djangae.fields import ListField, RelatedSetField
 
 
 PERMISSIONS_LIST = None
@@ -51,7 +53,10 @@ def get_permission_choices():
         for model in get_models(app):
             for action in AUTO_PERMISSIONS:
                 opts = model._meta
-                result.append((get_permission_codename(action, opts), 'Can %s %s' % (action, opts.verbose_name_raw)))
+                result.append((
+                    '%s.%s' % (opts.app_label, get_permission_codename(action, opts)),
+                    'Can %s %s' % (action, opts.verbose_name_raw)
+                ))
 
     PERMISSIONS_LIST = sorted(result)
     return PERMISSIONS_LIST
@@ -64,9 +69,8 @@ class Group(models.Model):
         uses the permission names
     """
     name = models.CharField(_('name'), max_length=80, unique=True)
-    permissions = ListField(models.CharField(max_length=500, choices=get_permission_choices()),
-        verbose_name=_('permissions'), blank=True,
-        choices=get_permission_choices()
+    permissions = ListField(models.CharField(max_length=500),
+        verbose_name=_('permissions'), blank=True
     )
 
     objects = GroupManager()
@@ -82,6 +86,14 @@ class Group(models.Model):
     def natural_key(self):
         return (self.name,)
 
+    def __init__(self, *args, **kwargs):
+        """We need to override this to make the choices lazy and prevent import madness"""
+        super(Group, self).__init__(*args, **kwargs)
+
+        field = self._meta.get_field_by_name('permissions')[0]
+        field._choices = lazy(get_permission_choices, list)()
+        field.item_field_type._choices = lazy(get_permission_choices, list)()
+
 
 class PermissionsMixin(models.Model):
     """
@@ -92,21 +104,28 @@ class PermissionsMixin(models.Model):
         help_text=_('Designates that this user has all permissions without '
                     'explicitly assigning them.')
     )
-    groups = ListField(
-        models.ForeignKey(Group), verbose_name=_('groups'),
+
+    groups = RelatedSetField(
+        Group,
+        verbose_name=_('groups'),
         blank=True, help_text=_('The groups this user belongs to. A user will '
                                 'get all permissions granted to each of '
                                 'his/her group.')
     )
+
     user_permissions = ListField(
         models.CharField(max_length=500),
         verbose_name=_('user permissions'), blank=True,
-        help_text='Specific permissions for this user.',
-        choices=get_permission_choices()
+        help_text='Specific permissions for this user.'
     )
 
     class Meta:
         abstract = True
+
+    def __init__(self, *args, **kwargs):
+        """We need to override this to make the choices lazy and prevent import madness"""
+        super(PermissionsMixin, self).__init__(*args, **kwargs)
+        self._meta.get_field_by_name('user_permissions')[0]._choices = lazy(get_permission_choices, list)()
 
     def get_group_permissions(self, obj=None):
         """
@@ -170,8 +189,8 @@ class GaeUserManager(UserManager):
 
     def pre_create_google_user(self, email, **extra_fields):
         """ Pre-create a User object for a user who will later log in via Google Accounts. """
-        values  = dict(
-            # defaults which can be overriden
+        values = dict(
+            # defaults which can be overridden
             is_active=True,
         )
         values.update(**extra_fields)
@@ -185,20 +204,21 @@ class GaeUserManager(UserManager):
         return self.create(**values)
 
 
-class GaeAbstractUser(AbstractBaseUser):
+@python_2_unicode_compatible
+class GaeAbstractBaseUser(AbstractBaseUser):
     """ Absract base class for creating a User model which works with the App Engine users API. """
 
     username = models.CharField(
         # This stores the Google user_id, or custom username for non-Google-based users.
         # We allow it to be null so that Google-based users can be pre-created before they log in.
-        _('User ID'), max_length=21, unique=True, null=True,
+        _('User ID'), max_length=21, unique=True, null=True, default=None,
         validators=[
             validators.RegexValidator(re.compile('^\d{21}$'), _('User Id should be 21 digits.'), 'invalid')
         ]
     )
     first_name = models.CharField(_('first name'), max_length=30, blank=True)
     last_name = models.CharField(_('last name'), max_length=30, blank=True)
-    email = models.EmailField(_('email address'))
+    email = models.EmailField(_('email address'), unique=True)
     is_staff = models.BooleanField(
         _('staff status'), default=False,
         help_text=_('Designates whether the user can log into this admin site.')
@@ -211,7 +231,6 @@ class GaeAbstractUser(AbstractBaseUser):
         )
     )
     date_joined = models.DateTimeField(_('date joined'), default=timezone.now)
-
 
     USERNAME_FIELD = 'username'
     REQUIRED_FIELDS = ['email']
@@ -241,8 +260,25 @@ class GaeAbstractUser(AbstractBaseUser):
         """
         send_mail(subject, message, from_email, [self.email])
 
+    def __str__(self):
+        """
+            We have to override this as username is nullable. We either return the email
+            address, or if there is a username, we return "email (username)".
+        """
+        username = self.get_username()
+        if username:
+            return "{} ({})".format(six.text_type(self.email), six.text_type(username))
+        return six.text_type(self.email)
 
-class GaeUser(GaeAbstractUser):
+class GaeAbstractUser(GaeAbstractBaseUser, DjangoPermissionsMixin):
+    """
+    Abstract user class for SQL databases.
+    """
+    class Meta:
+        abstract = True
+
+
+class GaeUser(GaeAbstractBaseUser, DjangoPermissionsMixin):
     """ A basic user model which can be used with GAE authentication.
         Essentially the equivalent of django.contrib.auth.models.User.
         Cannot be used with permissions when using the Datastore, because it
@@ -256,7 +292,7 @@ class GaeUser(GaeAbstractUser):
         verbose_name_plural = _('users')
 
 
-class GaeAbstractDatastoreUser(GaeAbstractUser, PermissionsMixin):
+class GaeAbstractDatastoreUser(GaeAbstractBaseUser, PermissionsMixin):
     """ Base class for a user model which can be used with GAE authentication
         and permissions on the Datastore.
     """
@@ -265,7 +301,7 @@ class GaeAbstractDatastoreUser(GaeAbstractUser, PermissionsMixin):
         abstract = True
 
 
-class GaeDatastoreUser(GaeAbstractUser, PermissionsMixin):
+class GaeDatastoreUser(GaeAbstractBaseUser, PermissionsMixin):
     """ A basic user model which can be used with GAE authentication and allows
         permissions to work on the Datastore backend.
     """

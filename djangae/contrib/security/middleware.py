@@ -1,20 +1,18 @@
 import __builtin__
-
-import cPickle
 import functools
-import io
 import json
 import logging
-import pickle
 import yaml
 
 from google.appengine.api import urlfetch
 
 from django.conf import settings
+from django.core.exceptions import MiddlewareNotUsed
 
 class ApiSecurityException(Exception):
-  """Error when attempting to call an unsafe API."""
-  pass
+    """Error when attempting to call an unsafe API."""
+    pass
+
 
 def find_argument_index(function, argument):
     args = function.func_code.co_varnames[:function.func_code.co_argcount]
@@ -49,6 +47,7 @@ _JSON_CHARACTER_REPLACEMENT_MAPPING = [
     ('&', '\\u%04x' % ord('&')),
 ]
 
+
 class _JsonEncoderForHtml(json.JSONEncoder):
     def encode(self, o):
         chunks = self.iterencode(o, _one_shot=True)
@@ -62,49 +61,6 @@ class _JsonEncoderForHtml(json.JSONEncoder):
             for (character, replacement) in _JSON_CHARACTER_REPLACEMENT_MAPPING:
                 chunk = chunk.replace(character, replacement)
             yield chunk
-
-# Pickle.  See http://www.cs.jhu.edu/~s/musings/pickle.html for more info.
-# Whitelist of module name => (module, [list of safe names])
-_PICKLE_CLASS_WHITELIST = {
-    '__builtin__': (__builtin__, [
-        'basestring',
-        'bool',
-        'buffer',
-        'bytearray',
-        'bytes',
-        'complex',
-        'dict',
-        'enumerate',
-        'float',
-        'frozenset',
-        'int',
-        'list',
-        'long',
-        'reversed',
-        'set',
-        'slice',
-        'str',
-        'tuple',
-        'unicode',
-        'xrange'
-    ]),
-}
-
-# See https://docs.python.org/3/library/pickle.html#restricting-globals.
-class RestrictedUnpickler(pickle.Unpickler):
-
-    def find_class(self, module_name, name):
-        (module, safe_names) = _PICKLE_CLASS_WHITELIST.get(module_name, (None, []))
-        if name in safe_names:
-            return getattr(module, name)
-        raise ApiSecurityException('%s.%s forbidden in unpickling' % (module, name))
-
-def _SafePickleLoad(f):
-    return RestrictedUnpickler(f).load()
-
-def _SafePickleLoads(string):
-    return RestrictedUnpickler(io.BytesIO(string)).load()
-
 
 def _HttpUrlLoggingWrapper(func):
     """Decorates func, logging when 'url' params do not start with https://."""
@@ -127,7 +83,7 @@ def _HttpUrlLoggingWrapper(func):
         return func(*args, **kwargs)
     return _CheckAndLog
 
-_PATCHES_APPLIED = False
+PATCHES_APPLIED = False
 
 class AppEngineSecurityMiddleware(object):
     """
@@ -137,20 +93,13 @@ class AppEngineSecurityMiddleware(object):
 
         You should add this middleware first in your middleware classes
     """
-    def process_request(self, request):
-        global _PATCHES_APPLIED
 
-        if not _PATCHES_APPLIED:
+    def __init__(self, *args, **kwargs):
+        global PATCHES_APPLIED
+        if not PATCHES_APPLIED:
             # json module does not escape HTML metacharacters by default.
             replace_default_argument(json.dump, 'cls', _JsonEncoderForHtml)
             replace_default_argument(json.dumps, 'cls', _JsonEncoderForHtml)
-
-            #Make pickle safe
-            pickle.load = _SafePickleLoad
-            pickle.loads = _SafePickleLoads
-            cPickle.load = _SafePickleLoad
-            cPickle.loads = _SafePickleLoads
-
 
             # YAML.  The Python tag scheme allows arbitrary code execution:
             # yaml.load('!!python/object/apply:os.system ["ls"]')
@@ -160,7 +109,6 @@ class AppEngineSecurityMiddleware(object):
             replace_default_argument(yaml.load_all, 'Loader', yaml.loader.SafeLoader)
             replace_default_argument(yaml.parse, 'Loader', yaml.loader.SafeLoader)
             replace_default_argument(yaml.scan, 'Loader', yaml.loader.SafeLoader)
-
 
             # AppEngine urlfetch.
             # Does not validate certificates by default.
@@ -173,4 +121,5 @@ class AppEngineSecurityMiddleware(object):
                 if not getattr(settings, setting, False):
                     logging.warning("settings.%s is not set to True, this is insecure", setting)
 
-            _PATCHES_APPLIED = True
+            PATCHES_APPLIED = True
+        raise MiddlewareNotUsed()

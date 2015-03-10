@@ -1,17 +1,20 @@
 import datetime
 import logging
 
+from django.core.exceptions import NON_FIELD_ERRORS
+
 from google.appengine.ext import db
 from google.appengine.api.datastore import Key, Delete
 from google.appengine.datastore.datastore_rpc import TransactionOptions
 
 from .unique_utils import unique_identifiers_from_entity
 from .utils import key_exists
-from .exceptions import IntegrityError
+from djangae.db.backends.appengine.dbapi import IntegrityError
 
 from django.conf import settings
 
 DJANGAE_LOG = logging.getLogger("djangae")
+
 
 def constraint_checks_enabled(model_or_instance):
     """
@@ -29,35 +32,48 @@ def constraint_checks_enabled(model_or_instance):
     return not getattr(settings, "DJANGAE_DISABLE_CONSTRAINT_CHECKS", False)
 
 
+
+class KeyProperty(db.Property):
+    """A property that stores a datastore.Key reference to another object.
+        Think of this as a Django GenericForeignKey which returns only the PK value, not the whole
+        object, or a db.ReferenceProperty which can point to any model kind, and only returns the Key.
+    """
+
+    def validate(self, value):
+        if value is None or isinstance(value, Key):
+            return value
+        raise ValueError("KeyProperty only accepts datastore.Key or None")
+
+
 class UniqueMarker(db.Model):
-    instance = db.StringProperty()
+    instance = KeyProperty()
     created = db.DateTimeProperty(required=True, auto_now_add=True)
 
     @staticmethod
     def kind():
-        return "__unique_marker"
+        return "_djangae_unique_marker"
+
 
 def acquire_identifiers(identifiers, entity_key):
     @db.transactional(propagation=TransactionOptions.INDEPENDENT, xg=True)
     def acquire_marker(identifier):
         identifier_key = Key.from_path(UniqueMarker.kind(), identifier)
 
-
         marker = UniqueMarker.get(identifier_key)
         if marker:
-            #If the marker instance is None, and the marker is older then 5 seconds then we wipe it out
-            #and assume that it's stale.
+            # If the marker instance is None, and the marker is older then 5 seconds then we wipe it out
+            # and assume that it's stale.
             if not marker.instance and (datetime.datetime.utcnow() - marker.created).seconds > 5:
                 marker.delete()
-            elif marker.instance and Key(marker.instance) != entity_key and key_exists(Key(marker.instance)):
+            elif marker.instance and marker.instance != entity_key and key_exists(marker.instance):
                 raise IntegrityError("Unable to acquire marker for %s" % identifier)
             else:
-                #The marker is ours anyway
+                # The marker is ours anyway
                 return marker
 
         marker = UniqueMarker(
             key=identifier_key,
-            instance=str(entity_key) if entity_key.id_or_name() else None, #May be None if unsaved
+            instance=entity_key if entity_key.id_or_name() else None,  # May be None if unsaved
             created=datetime.datetime.utcnow()
         )
         marker.put()
@@ -69,8 +85,7 @@ def acquire_identifiers(identifiers, entity_key):
             markers.append(acquire_marker(identifier))
             DJANGAE_LOG.debug("Acquired unique marker for %s", identifier)
     except:
-        for marker in markers:
-            marker.delete()
+        release_markers(markers)
         DJANGAE_LOG.debug("Due to an error, deleted markers %s", markers)
         raise
     return markers
@@ -89,6 +104,7 @@ def get_markers_for_update(model, old_entity, new_entity):
 
     return to_acquire, to_release
 
+
 def update_instance_on_markers(entity, markers):
 
     @db.transactional(propagation=TransactionOptions.INDEPENDENT)
@@ -100,9 +116,10 @@ def update_instance_on_markers(entity, markers):
         marker.instance = instance
         marker.put()
 
-    instance = str(entity.key())
+    instance = entity.key()
     for marker in markers:
         update(marker, instance)
+
 
 def acquire_bulk(model, entities):
     markers = []
@@ -115,6 +132,7 @@ def acquire_bulk(model, entities):
             release_markers(m)
         raise
     return markers
+
 
 def acquire(model, entity):
     """
@@ -131,18 +149,65 @@ def release_markers(markers):
     def delete(marker):
         Delete(marker.key())
 
-    [ delete(x) for x in markers ]
+    [delete(x) for x in markers]
+
 
 def release_identifiers(identifiers):
 
     @db.non_transactional
     def delete():
-        keys = [ Key.from_path(UniqueMarker.kind(), x) for x in identifiers ]
+        keys = [Key.from_path(UniqueMarker.kind(), x) for x in identifiers]
         Delete(keys)
 
     delete()
     DJANGAE_LOG.debug("Deleted markers with identifiers: %s", identifiers)
 
+
 def release(model, entity):
     identifiers = unique_identifiers_from_entity(model, entity, ignore_pk=True)
     release_identifiers(identifiers)
+
+
+class UniquenessMixin(object):
+    """ Mixin overriding the methods checking value uniqueness.
+
+    For models defining unique constraints this mixin should be inherited from.
+    When iterable (list or set) fields are marked as unique it must be used.
+    This is a copy of Django's implementation, save for the part marked by the comment.
+    """
+    def _perform_unique_checks(self, unique_checks):
+        errors = {}
+        for model_class, unique_check in unique_checks:
+            lookup_kwargs = {}
+            for field_name in unique_check:
+                f = self._meta.get_field(field_name)
+                lookup_value = getattr(self, f.attname)
+                if lookup_value is None:
+                    continue
+                if f.primary_key and not self._state.adding:
+                    continue
+
+                ##########################################################################
+                # This is the only modification to Django's native implementation of this method;
+                # we conditionally build a __in lookup if the value is an iterable.
+                lookup = str(field_name)
+                if isinstance(lookup_value, (list, set, tuple)):
+                    lookup = "%s__in" % lookup
+
+                lookup_kwargs[lookup] = lookup_value
+                ##########################################################################
+                # / end of changes
+
+            if len(unique_check) != len(lookup_kwargs):
+                continue
+            qs = model_class._default_manager.filter(**lookup_kwargs)
+            model_class_pk = self._get_pk_val(model_class._meta)
+            if not self._state.adding and model_class_pk is not None:
+                qs = qs.exclude(pk=model_class_pk)
+            if qs.exists():
+                if len(unique_check) == 1:
+                    key = unique_check[0]
+                else:
+                    key = NON_FIELD_ERRORS
+                errors.setdefault(key, []).append(self.unique_error_message(model_class, unique_check))
+        return errors

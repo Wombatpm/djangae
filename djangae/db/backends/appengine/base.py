@@ -1,7 +1,6 @@
 #STANDARD LIB
 import datetime
 import decimal
-import sys
 import warnings
 
 #LIBRARIES
@@ -14,29 +13,30 @@ from django.db.backends import (
     BaseDatabaseFeatures,
     BaseDatabaseValidation
 )
+
 try:
     from django.db.backends.schema import BaseDatabaseSchemaEditor
 except ImportError:
-    #Django < 1.6 doesn't have BaseDatabaseSchemaEditor
+    #Django < 1.7 doesn't have BaseDatabaseSchemaEditor
     class BaseDatabaseSchemaEditor(object):
         pass
+
 from django.db.backends.creation import BaseDatabaseCreation
-from django.db import IntegrityError
 from django.utils import timezone
 from google.appengine.api.datastore_types import Blob, Text
 from google.appengine.ext.db import metadata
 from google.appengine.ext import testbed
+from google.appengine.datastore import datastore_stub_util
 from google.appengine.api.datastore import Key
+from google.appengine.api import datastore
 
 #DJANGAE
-from djangae.utils import find_project_root
-from djangae.db.exceptions import DatabaseError, NotSupportedError, CouldBeSupportedError
 from djangae.db.utils import (
     decimal_to_string,
     make_timezone_naive,
     get_datastore_key,
 )
-from djangae.db.backends.appengine import caching
+from djangae.db import caching
 from djangae.indexing import load_special_indexes
 from .commands import (
     SelectCommand,
@@ -44,8 +44,11 @@ from .commands import (
     FlushCommand,
     UpdateCommand,
     DeleteCommand,
+    coerce_unicode,
     get_field_from_column
 )
+
+from djangae.db.backends.appengine import dbapi as Database
 
 
 class Connection(object):
@@ -78,7 +81,7 @@ class Cursor(object):
 
     def execute(self, sql, *params):
         if isinstance(sql, SelectCommand):
-            #Also catches subclasses of SelectCommand (e.g Update)
+            # Also catches subclasses of SelectCommand (e.g Update)
             self.last_select_command = sql
             self.rowcount = self.last_select_command.execute() or -1
         elif isinstance(sql, FlushCommand):
@@ -91,23 +94,7 @@ class Cursor(object):
             self.connection.queries.append(sql)
             self.returned_ids = sql.execute()
         else:
-            raise CouldBeSupportedError("Can't execute traditional SQL: '%s' (although perhaps we could make GQL work)", sql)
-
-    def fix_fk_null(self, query, constraint):
-        alias = constraint.alias
-        table_name = query.alias_map[alias][TABLE_NAME]
-        lhs_join_col, rhs_join_col = join_cols(query.alias_map[alias])
-        if table_name != constraint.field.rel.to._meta.db_table or \
-                rhs_join_col != constraint.field.rel.to._meta.pk.column or \
-                lhs_join_col != constraint.field.column:
-            return
-        next_alias = query.alias_map[alias][LHS_ALIAS]
-        if not next_alias:
-            return
-        self.unref_alias(query, alias)
-        alias = next_alias
-        constraint.col = constraint.field.column
-        constraint.alias = alias
+            raise Database.CouldBeSupportedError("Can't execute traditional SQL: '%s' (although perhaps we could make GQL work)", sql)
 
     def next(self):
         row = self.fetchone()
@@ -118,11 +105,11 @@ class Cursor(object):
     def fetchone(self, delete_flag=False):
         try:
             if isinstance(self.last_select_command.results, (int, long)):
-                #Handle aggregate (e.g. count)
+                # Handle aggregate (e.g. count)
                 return (self.last_select_command.results, )
             else:
                 entity = self.last_select_command.next_result()
-        except StopIteration: #FIXME: does this ever get raised?  Where from?
+        except StopIteration:  #FIXME: does this ever get raised?  Where from?
             entity = None
 
         if entity is None:
@@ -170,19 +157,6 @@ class Cursor(object):
     def __iter__(self):
         return self
 
-class Database(object):
-    """ Fake DB API 2.0 for App engine """
-
-    Error = DatabaseError
-    DataError = DatabaseError
-    DatabaseError = DatabaseError
-    OperationalError = DatabaseError
-    IntegrityError = IntegrityError
-    InternalError = DatabaseError
-    ProgrammingError = DatabaseError
-    NotSupportedError = NotSupportedError
-    InterfaceError = DatabaseError
-
 
 class DatabaseOperations(BaseDatabaseOperations):
     compiler_module = "djangae.db.backends.appengine.compiler"
@@ -206,30 +180,28 @@ class DatabaseOperations(BaseDatabaseOperations):
             value = self.connection.ops.value_from_db_time(value)
         elif db_type == "decimal":
             value = self.connection.ops.value_from_db_decimal(value)
+        elif db_type == 'list':
+            if not value:
+                value = [] # Convert None back to an empty list
+        elif db_type == 'set':
+            if not value:
+                value = set()
+            else:
+                value = set(value)
 
         return value
 
     def sql_flush(self, style, tables, seqs, allow_cascade=False):
-
-        creation = self.connection.creation
-        if creation.testbed:
-            creation._destroy_test_db(':memory:', verbosity=1)
-            creation._create_test_db(':memory:', autoclobber=True)
-            caching.clear_all_caches()
-            return []
-        else:
-            return [ FlushCommand(table) for table in tables ]
-
+        return [ FlushCommand(table) for table in tables ]
 
     def prep_lookup_key(self, model, value, field):
         if isinstance(value, basestring):
             value = value[:500]
             left = value[500:]
             if left:
-                warnings.warn("Truncating primary key"
-                    " that is over 500 characters. THIS IS AN ERROR IN YOUR PROGRAM.",
-                    RuntimeWarning
-                )
+                warnings.warn("Truncating primary key that is over 500 characters. "
+                              "THIS IS AN ERROR IN YOUR PROGRAM.",
+                              RuntimeWarning)
             value = get_datastore_key(model, value)
         else:
             value = get_datastore_key(model, value)
@@ -258,6 +230,12 @@ class DatabaseOperations(BaseDatabaseOperations):
             return self.prep_lookup_date(model, value, field)
         elif db_type == 'time':
             return self.prep_lookup_time(model, value, field)
+        elif db_type in ('list', 'set'):
+            if hasattr(value, "__len__") and not value:
+                value = None #Convert empty lists to None
+            elif hasattr(value, "__iter__"):
+                # Convert sets to lists
+                value = list(value)
 
         return value
 
@@ -268,12 +246,7 @@ class DatabaseOperations(BaseDatabaseOperations):
         db_type = field.db_type(self.connection)
 
         if db_type == 'string' or db_type == 'text':
-            if isinstance(value, str):
-                try:
-                    value = value.decode('utf-8')
-                except UnicodeDecodeError:
-                    raise DatabaseError("Bytestring is not encoded in utf-8")
-
+            value = coerce_unicode(value)
             if db_type == 'text':
                 value = Text(value)
         elif db_type == 'bytes':
@@ -287,6 +260,12 @@ class DatabaseOperations(BaseDatabaseOperations):
             value = self.value_to_db_time(value)
         elif db_type == 'decimal':
             value = self.value_to_db_decimal(value, field.max_digits, field.decimal_places)
+        elif db_type in ('list', 'set'):
+            if hasattr(value, "__len__") and not value:
+                value = None #Convert empty lists to None
+            elif hasattr(value, "__iter__"):
+                # Convert sets to lists
+                value = list(value)
 
         return value
 
@@ -316,10 +295,10 @@ class DatabaseOperations(BaseDatabaseOperations):
             return decimal_to_string(value, max_digits, decimal_places)
         return value
 
-    ##Unlike value_to_db, these are not overridden or standard Django, it's just nice to have symmetry
+    # Unlike value_to_db, these are not overridden or standard Django, it's just nice to have symmetry
     def value_from_db_datetime(self, value):
         if isinstance(value, (int, long)):
-            #App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
+            # App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
             value = datetime.datetime.fromtimestamp(float(value) / 1000000.0)
 
         if value is not None and settings.USE_TZ and timezone.is_naive(value):
@@ -328,24 +307,30 @@ class DatabaseOperations(BaseDatabaseOperations):
 
     def value_from_db_date(self, value):
         if isinstance(value, (int, long)):
-            #App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
+            # App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
             value = datetime.datetime.fromtimestamp(float(value) / 1000000.0)
 
-        return value.date()
+        if value:
+            value = value.date()
+        return value
 
     def value_from_db_time(self, value):
         if isinstance(value, (int, long)):
-            #App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
+            # App Engine Query's don't return datetime fields (unlike Get) I HAVE NO IDEA WHY, APP ENGINE SUCKS MONKEY BALLS
             value = datetime.datetime.fromtimestamp(float(value) / 1000000.0).time()
 
         if value is not None and settings.USE_TZ and timezone.is_naive(value):
             value = value.replace(tzinfo=timezone.utc)
-        return value.time()
+
+        if value:
+            value = value.time()
+        return value
 
     def value_from_db_decimal(self, value):
         if value:
             value = decimal.Decimal(value)
         return value
+
 
 class DatabaseClient(BaseDatabaseClient):
     pass
@@ -379,15 +364,8 @@ class DatabaseCreation(BaseDatabaseCreation):
         'SmallIntegerField':          'integer',
         'TimeField':                  'time',
         'URLField':                   'string',
-        'AbstractIterableField':      'list',
-        'ListField':                  'list',
-        'RawField':                   'raw',
-        'BlobField':                  'bytes',
         'TextField':                  'text',
         'XMLField':                   'text',
-        'SetField':                   'list',
-        'DictField':                  'bytes',
-        'EmbeddedModelField':         'bytes'
     }
 
     def __init__(self, *args, **kwargs):
@@ -404,51 +382,36 @@ class DatabaseCreation(BaseDatabaseCreation):
         return []
 
     def _create_test_db(self, verbosity, autoclobber):
-        from google.appengine.datastore import datastore_stub_util
-        # Testbed exists in memory
-        test_database_name = ':memory:'
+        assert not self.testbed
 
-        # Init test stubs
+        # We allow users to disable scattered IDs in tests. This primarily for running Django tests that
+        # assume implicit ordering (yeah, annoying)
+        use_scattered = not getattr(settings, "DJANGAE_SEQUENTIAL_IDS_IN_TESTS", False)
+
+        kwargs = {
+            "use_sqlite": True,
+            "auto_id_policy": testbed.AUTO_ID_POLICY_SCATTERED if use_scattered else testbed.AUTO_ID_POLICY_SEQUENTIAL,
+            "consistency_policy": datastore_stub_util.PseudoRandomHRConsistencyPolicy(probability=1)
+        }
+
         self.testbed = testbed.Testbed()
         self.testbed.activate()
-
-        self.testbed.init_app_identity_stub()
-        self.testbed.init_blobstore_stub()
-        self.testbed.init_capability_stub()
-        self.testbed.init_channel_stub()
-
-        self.testbed.init_datastore_v3_stub(
-            use_sqlite=True,
-            auto_id_policy=testbed.AUTO_ID_POLICY_SCATTERED,
-            consistency_policy=datastore_stub_util.PseudoRandomHRConsistencyPolicy(probability=1)
-        )
-        self.testbed.init_files_stub()
-        # FIXME! dependencies PIL
-        # self.testbed.init_images_stub()
-        self.testbed.init_logservice_stub()
-        self.testbed.init_mail_stub()
+        self.testbed.init_datastore_v3_stub(**kwargs)
         self.testbed.init_memcache_stub()
-        self.testbed.init_taskqueue_stub(root_path=find_project_root())
-        self.testbed.init_urlfetch_stub()
-        self.testbed.init_user_stub()
-        self.testbed.init_xmpp_stub()
-        # self.testbed.init_search_stub()
-
-        # Init all the stubs!
-        # self.testbed.init_all_stubs()
-
-        return test_database_name
-
+        caching.clear_context_cache()
 
     def _destroy_test_db(self, name, verbosity):
         if self.testbed:
+            caching.clear_context_cache()
             self.testbed.deactivate()
-        self.testbed = None
+            self.testbed = None
 
 
 class DatabaseIntrospection(BaseDatabaseIntrospection):
+    @datastore.NonTransactional
     def get_table_list(self, cursor):
         return metadata.get_kinds()
+
 
 class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
     def column_sql(self, model, field):
@@ -458,13 +421,15 @@ class DatabaseSchemaEditor(BaseDatabaseSchemaEditor):
         """ Don't do anything when creating tables """
         pass
 
+
 class DatabaseFeatures(BaseDatabaseFeatures):
     empty_fetchmany_value = []
-    supports_transactions = False #FIXME: Make this True!
+    supports_transactions = False  #FIXME: Make this True!
     can_return_id_from_insert = True
     supports_select_related = False
     autocommits_when_autocommit_is_off = True
     uses_savepoints = False
+
 
 class DatabaseWrapper(BaseDatabaseWrapper):
     operators = {
@@ -496,7 +461,7 @@ class DatabaseWrapper(BaseDatabaseWrapper):
 
     def get_new_connection(self, params):
         conn = Connection(self, params)
-        load_special_indexes() #make sure special indexes are loaded
+        load_special_indexes()  # make sure special indexes are loaded
         return conn
 
     def init_connection_state(self):
@@ -518,5 +483,5 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         return DatabaseSchemaEditor(self, *args, **kwargs)
 
     def _cursor(self):
-        #for < Django 1.6 compatiblity
+        # For < Django 1.6 compatibility
         return self.create_cursor()

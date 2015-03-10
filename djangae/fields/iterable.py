@@ -1,19 +1,9 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-import random
-
-from django.db import models
-from django.utils.translation import ugettext_lazy as _
-from django.core.exceptions import ValidationError
-from django.db.models.fields.subclassing import Creator
-from django.utils.text import capfirst
 from django import forms
-from djangae.forms.fields import TrueOrNullFormField, IterableFieldModelChoiceFormField, ListFormField
-from django.db.models.loading import get_model
-
-from djangae.db import transaction
-from djangae.models import CounterShard
+from django.db import models
+from django.core.exceptions import ValidationError, ImproperlyConfigured
+from django.db.models.fields.subclassing import Creator
+from djangae.forms.fields import ListFormField
+from django.utils.text import capfirst
 
 class _FakeModel(object):
     """
@@ -26,67 +16,48 @@ class _FakeModel(object):
         setattr(self, field.attname, value)
 
 
-class RawField(models.Field):
-    """
-    Generic field to store anything your database backend allows you
-    to. No validation or conversions are done for this field.
-    """
-
-    def get_internal_type(self):
-        """
-        Returns this field's kind. Nonrel fields are meant to extend
-        the set of standard fields, so fields subclassing them should
-        get the same internal type, rather than their own class name.
-        """
-        return 'RawField'
-
-class TrueOrNullField(models.NullBooleanField):
-    """A Field only storing `Null` or `True` values.
-
-    Why? This allows unique_together constraints on fields of this type
-    ensuring that only a single instance has the `True` value.
-
-    It mimics the NullBooleanField field in it's behaviour, while it will
-    raise an exception when explicitly validated, assigning something
-    unexpected (like a string) and saving, will silently convert that
-    value to either True or None.
-    """
-    __metaclass__ = models.SubfieldBase
-
-    default_error_messages = {
-        'invalid': _("'%s' value must be either True or None."),
-    }
-    description = _("Boolean (Either True or None)")
-
-    def to_python(self, value):
-        if value in (None, 'None', False):
-            return None
-        if value in (True, 't', 'True', '1'):
-            return True
-        msg = self.error_messages['invalid'] % str(value)
-        raise ValidationError(msg)
-
-    def get_prep_value(self, value):
-        """Only ever save None's or True's in the db. """
-        if value in (None, False, '', 0):
-            return None
-        return True
-
-    def formfield(self, **kwargs):
-        defaults = {
-            'form_class': TrueOrNullFormField
-        }
-        defaults.update(kwargs)
-        return super(TrueOrNullField, self).formfield(**defaults)
-
-
 class IterableField(models.Field):
     __metaclass__ = models.SubfieldBase
 
     @property
     def _iterable_type(self): raise NotImplementedError()
 
-    def __init__(self, item_field_type=None, *args, **kwargs):
+    def db_type(self, connection):
+        return 'list'
+
+    def get_prep_lookup(self, lookup_type, value):
+        if hasattr(value, 'prepare'):
+            return value.prepare()
+        if hasattr(value, '_prepare'):
+            return value._prepare()
+
+        if value is None:
+            raise ValueError("You can't query an iterable field with None")
+
+        if lookup_type == 'isnull' and value in (True, False):
+            return value
+
+        if lookup_type != 'exact' and lookup_type != 'in':
+            raise ValueError("You can only query using exact and in lookups on iterable fields")
+
+        if isinstance(value, (list, set)):
+            return [ self.item_field_type.to_python(x) for x in value ]
+
+        return self.item_field_type.to_python(value)
+
+    def get_prep_value(self, value):
+        if value is None:
+            raise ValueError("You can't set a {} to None (did you mean {}?)".format(
+                self.__class__.__name__, str(self._iterable_type())
+            ))
+
+        if isinstance(value, basestring):
+            # Catch accidentally assigning a string to a ListField
+            raise ValueError("Tried to assign a string to a {}".format(self.__class__.__name__))
+
+        return super(IterableField, self).get_prep_value(value)
+
+    def __init__(self, item_field_type, *args, **kwargs):
 
         # This seems bonkers, we shout at people for specifying null=True, but then do it ourselves. But this is because
         # *we* abuse None values for our own purposes (to represent an empty iterable) if someone else tries to then
@@ -104,19 +75,8 @@ class IterableField(models.Field):
         if callable(item_field_type):
             item_field_type = item_field_type()
 
-        item_field_type = item_field_type or RawField()
-
-        self.fk_model = None
         if isinstance(item_field_type, models.ForeignKey):
-            self.fk_model = item_field_type.rel.to
-
-            if isinstance(self.fk_model, basestring):
-                self.fk_model = get_model(*self.fk_model.split("."))
-
-            if isinstance(self.fk_model._meta.pk, models.AutoField):
-                item_field_type = models.PositiveIntegerField()
-            else:
-                raise NotImplementedError("No-autofield related PKs not yet supported")
+            raise ImproperlyConfigured("Lists of ForeignKeys aren't supported, use RelatedSetField instead")
 
         self.item_field_type = item_field_type
 
@@ -144,6 +104,11 @@ class IterableField(models.Field):
         if value is None:
             return self._iterable_type([])
 
+        # Because a set cannot be defined in JSON, we must allow a list to be passed as the value
+        # of a SetField, as otherwise SetField data can't be loaded from fixtures
+        if not hasattr(value, "__iter__"): # Allows list/set, not string
+            raise ValueError("Tried to assign a {} to a {}".format(value.__class__.__name__, self.__class__.__name__))
+
         return self._map(self.item_field_type.to_python, value)
 
     def pre_save(self, model_instance, add):
@@ -153,41 +118,31 @@ class IterableField(models.Field):
         """
         value = getattr(model_instance, self.attname)
         if value is None:
-            return self._iterable_type([])
+            return None
 
         return self._map(lambda item: self.item_field_type.pre_save(_FakeModel(self.item_field_type, item), add), value)
 
-    def get_db_prep_save(self, value, connection):
-        """
-        Applies get_db_prep_save of item_field on value items.
-        """
+    def get_db_prep_value(self, value, connection, prepared=False):
+        if not prepared:
+            value = self.get_prep_value(value)
+            if value is None:
+                return None
 
-        #If the value is an empty iterable, store None
+        # If the value is an empty iterable, store None
         if value == self._iterable_type([]):
             return None
 
         return self._map(self.item_field_type.get_db_prep_save, value,
                          connection=connection)
 
+
     def get_db_prep_lookup(self, lookup_type, value, connection,
                            prepared=False):
         """
         Passes the value through get_db_prep_lookup of item_field.
         """
-
-        # TODO/XXX: Remove as_lookup_value() once we have a cleaner
-        # solution for dot-notation queries.
-        # See: https://groups.google.com/group/django-non-relational/browse_thread/thread/6056f8384c9caf04/89eeb9fb22ad16f3).
-        if hasattr(value, 'as_lookup_value'):
-            value = value.as_lookup_value(self, lookup_type, connection)
-
         return self.item_field_type.get_db_prep_lookup(
             lookup_type, value, connection=connection, prepared=prepared)
-
-    def get_prep_lookup(self, lookup_type, value):
-        if value == self._iterable_type():
-            return None
-        return super(IterableField, self).get_prep_lookup(lookup_type, value)
 
     def validate(self, value_list, model_instance):
         """ We want to override the default validate method from django.db.fields.Field, because it
@@ -224,7 +179,7 @@ class IterableField(models.Field):
 
     def formfield(self, **kwargs):
         """ If this field has choices, then we can use a multiple choice field.
-            NB: The chioces must be set on *this* field, e.g. this_field = ListField(CharField(), choices=x)
+            NB: The choices must be set on *this* field, e.g. this_field = ListField(CharField(), choices=x)
             as opposed to: this_field = ListField(CharField(choices=x))
         """
         #Largely lifted straight from Field.formfield() in django.models.__init__.py
@@ -236,12 +191,7 @@ class IterableField(models.Field):
             else:
                 defaults['initial'] = self.get_default()
 
-        if getattr(self, "fk_model", None):
-            #The type passed into this ListField was a ForeignKey, set the form field and
-            #queryset appropriately
-            form_field_class = IterableFieldModelChoiceFormField
-            defaults['queryset'] = self.fk_model.objects.all()
-        elif self.choices:
+        if self.choices:
             form_field_class = forms.MultipleChoiceField
             defaults['choices'] = self.get_choices(include_blank=False) #no empty value on a multi-select
         else:
@@ -258,9 +208,6 @@ class ListField(IterableField):
                             "not of type %r." % type(self.ordering))
         super(ListField, self).__init__(*args, **kwargs)
 
-    def get_internal_type(self):
-        return 'ListField'
-
     def pre_save(self, model_instance, add):
         value = super(ListField, self).pre_save(model_instance, add)
 
@@ -273,13 +220,14 @@ class ListField(IterableField):
     def _iterable_type(self):
         return list
 
-class SetField(IterableField):
-    def get_internal_type(self):
-        return 'SetField'
 
+class SetField(IterableField):
     @property
     def _iterable_type(self):
         return set
+
+    def db_type(self, connection):
+        return 'set'
 
     def get_db_prep_save(self, *args, **kwargs):
         ret = super(SetField, self).get_db_prep_save(*args, **kwargs)
@@ -299,86 +247,3 @@ class SetField(IterableField):
         serializing sets.
         """
         return str(list(self._get_val_from_obj(obj)))
-
-
-class ComputedFieldMixin(object):
-    def __init__(self, func, *args, **kwargs):
-        self.computer = func
-
-        kwargs["editable"] = False
-
-        super(ComputedFieldMixin, self).__init__(*args, **kwargs)
-
-    def pre_save(self, model_instance, add):
-        value = self.computer(model_instance)
-        setattr(model_instance, self.attname, value)
-        return value
-
-
-class ComputedCharField(ComputedFieldMixin, models.CharField):
-    __metaclass__ = models.SubfieldBase
-
-
-class ComputedIntegerField(ComputedFieldMixin, models.IntegerField):
-    __metaclass__ = models.SubfieldBase
-
-
-class ComputedTextField(ComputedFieldMixin, models.TextField):
-    __metaclass__ = models.SubfieldBase
-
-
-class ComputedPositiveIntegerField(ComputedFieldMixin, models.PositiveIntegerField):
-    __metaclass__ = models.SubfieldBase
-
-
-class ShardedCounter(list):
-    def increment(self):
-        idx = random.randint(0, len(self) - 1)
-
-        with transaction.atomic():
-            shard = CounterShard.objects.get(pk=self[idx])
-            shard.count += 1
-            shard.save()
-
-    def decrement(self):
-        #Find a non-empty shard and decrement it
-        shards = self[:]
-        random.shuffle(shards)
-        for shard_id in shards:
-            with transaction.atomic():
-                shard = CounterShard.objects.get(pk=shard_id)
-                if not shard.count:
-                    continue
-                else:
-                    shard.count -= 1
-                    shard.save()
-                    break
-
-    def value(self):
-        shards = CounterShard.objects.filter(pk__in=self).values_list('count', flat=True)
-        return sum(shards)
-
-class ShardedCounterField(ListField):
-    __metaclass__ = models.SubfieldBase
-
-    def __init__(self, shard_count=30, *args, **kwargs):
-        self.shard_count = shard_count
-        super(ShardedCounterField, self).__init__(*args, **kwargs)
-
-    def pre_save(self, model_instance, add):
-        value = super(ShardedCounterField, self).pre_save(model_instance, add)
-        current_length = len(value)
-
-        for i in xrange(current_length, self.shard_count):
-            value.append(CounterShard.objects.create(count=0).pk)
-
-        ret = ShardedCounter(value)
-        setattr(model_instance, self.attname, ret)
-        return ret
-
-    def to_python(self, value):
-        value = super(ShardedCounterField, self).to_python(value)
-        return ShardedCounter(value)
-
-    def get_prep_value(self, value):
-        return value

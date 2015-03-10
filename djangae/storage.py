@@ -1,5 +1,4 @@
 import mimetypes
-import os
 import re
 
 try:
@@ -7,48 +6,86 @@ try:
 except ImportError:
     from StringIO import StringIO
 
-from django.conf import settings
 from django.core.files.base import File
 from django.core.files.storage import Storage
 from django.core.files.uploadedfile import UploadedFile
 from django.core.files.uploadhandler import FileUploadHandler, \
     StopFutureHandlers
-from django.core.exceptions import ImproperlyConfigured
 from django.http import HttpResponse
-from django.http.multipartparser import ChunkIter, Parser, LazyStream, FILE
 from django.utils.encoding import smart_str, force_unicode
 
 from google.appengine.api import files
 from google.appengine.api.images import get_serving_url, NotImageError
-from google.appengine.ext.blobstore import BlobInfo, BlobKey, delete, \
-    create_upload_url, BLOB_KEY_HEADER, BLOB_RANGE_HEADER, BlobReader
+from google.appengine.ext.blobstore import (
+    BlobInfo,
+    BlobKey,
+    delete,
+    BLOB_KEY_HEADER,
+    BLOB_RANGE_HEADER,
+    BlobReader,
+    create_gs_key,
+)
+
+try:
+    import cloudstorage
+    has_cloudstorage = True
+except ImportError:
+    has_cloudstorage = False
 
 
-def prepare_upload(request, url, **kwargs):
-    return create_upload_url(url), {}
+def serve_file(request, blob_key_or_info, as_download=False, content_type=None, filename=None, offset=None, size=None):
+    """
+        Serves a file from the blobstore, reads most of the data from the blobinfo by default but you can override stuff
+        by passing kwargs.
 
+        You can also pass a Google Cloud Storage filename as `blob_key_or_info` to use Blobstore API to serve the file:
+        https://cloud.google.com/appengine/docs/python/blobstore/#Python_Using_the_Blobstore_API_with_Google_Cloud_Storage
+    """
 
-def serve_file(request, file, save_as, content_type, **kwargs):
-    if isinstance(file, BlobKey):
-        blobkey = file
-    elif hasattr(file, 'file') and hasattr(file.file, 'blobstore_info'):
-        blobkey = file.file.blobstore_info.key()
-    elif hasattr(file, 'blobstore_info'):
-        blobkey = file.blobstore_info.key()
+    if isinstance(blob_key_or_info, BlobKey):
+        info = BlobInfo.get(blob_key_or_info)
+        blob_key = blob_key_or_info
+    elif isinstance(blob_key_or_info, basestring):
+        info = BlobInfo.get(BlobKey(blob_key_or_info))
+        blob_key = BlobKey(blob_key_or_info)
+    elif isinstance(blob_key_or_info, BlobInfo):
+        info = blob_key_or_info
+        blob_key = info.key()
     else:
-        raise ValueError("The provided file can't be served via the "
-                         "Google App Engine Blobstore.")
-    response = HttpResponse(content_type=content_type)
-    response[BLOB_KEY_HEADER] = str(blobkey)
+        raise ValueError("Invalid type %s" % blob_key_or_info.__class__)
+
+    if info == None:
+        # Lack of blobstore_info means this is a Google Cloud Storage file
+        if has_cloudstorage:
+            info = cloudstorage.stat(blob_key_or_info)
+            info.size = info.st_size
+            blob_key = create_gs_key('/gs{0}'.format(blob_key_or_info))
+        else:
+            raise ImportError("To serve a Cloud Storage file you need to install cloudstorage")
+
+    response = HttpResponse(content_type=content_type or info.content_type)
+    response[BLOB_KEY_HEADER] = str(blob_key)
     response['Accept-Ranges'] = 'bytes'
     http_range = request.META.get('HTTP_RANGE')
+
+    if offset or size:
+        # Looks a little bonkers, but basically create the HTTP range string, we cast to int first to make sure
+        # nothing funky gets into the headers
+        http_range = "{}-{}".format(
+            str(int(offset)) if offset else "",
+            str(int(offset or 0) + size) if size else ""
+        )
+
     if http_range is not None:
         response[BLOB_RANGE_HEADER] = http_range
-    if save_as:
-        response['Content-Disposition'] = smart_str(
-            u'attachment; filename="%s"' % save_as)
 
-    info = BlobInfo.get(blobkey)
+    if as_download:
+        response['Content-Disposition'] = smart_str(
+            u'attachment; filename="%s"' % filename or info.filename
+        )
+    elif filename:
+        raise ValueError("You can't specify a filename without also specifying as_download")
+
     if info.size is not None:
         response['Content-Length'] = info.size
     return response
@@ -105,8 +142,8 @@ class BlobstoreStorage(Storage):
 
     def url(self, name):
         try:
-            #return a protocol-less URL, because django can't/won't pass
-            #down an argument saying whether it should be secure or not
+            # Return a protocol-less URL, because django can't/won't pass
+            # down an argument saying whether it should be secure or not
             url = get_serving_url(self._get_blobinfo(name))
             return re.sub("http://", "//", url)
         except NotImageError:
@@ -162,7 +199,7 @@ class BlobstoreFileUploadHandler(FileUploadHandler):
         """
             We can kill a lot of this hackery in Django 1.7 when content_type_extra is actually passed in!
         """
-        self.data.seek(0) #Rewind
+        self.data.seek(0)  # Rewind
         data = self.data.read()
 
         parts = data.split(self.boundary)
@@ -174,11 +211,11 @@ class BlobstoreFileUploadHandler(FileUploadHandler):
             if not blob_key:
                 continue
 
-            #OK, we have a blob key, but is it the one for the field?
+            # OK, we have a blob key, but is it the one for the field?
             match = re.search('\sname="?(?P<field_name>[a-zA-Z0-9_-]+)', part)
             name = match.groupdict().get('field_name') if match else None
             if name != field_name:
-                #Nope, not for this field
+                # Nope, not for this field
                 continue
 
             self.blobkey = blob_key
@@ -197,7 +234,7 @@ class BlobstoreFileUploadHandler(FileUploadHandler):
         """
         self.boundary = boundary
         if hasattr(input_data, "body"):
-            self.data = StringIO(input_data.body) #Create a string IO object
+            self.data = StringIO(input_data.body)  # Create a string IO object
         else:
             self.data = input_data
         return None #Pass back to Django

@@ -11,82 +11,102 @@ from google.appengine.datastore.datastore_rpc import TransactionOptions
 
 from djangae.db.backends.appengine import caching
 
-class AtomicDecorator(object):
-    def __init__(self, *args, **kwargs):
-        self.func = None
 
-        self.xg = kwargs.get("xg")
-        self.independent = kwargs.get("independent")
-        self.parent_conn = None
-
-        if len(args) == 1 and callable(args[0]):
-            self.func = args[0]
-
-    def _begin(self):
-        options = CreateTransactionOptions(
-            xg = True if self.xg else False,
-            propagation = TransactionOptions.INDEPENDENT if self.independent else None
-        )
-
-        if IsInTransaction() and not self.independent:
-            raise RuntimeError("Nested transactions are not supported")
-        elif self.independent:
-            #If we're running an independent transaction, pop the current one
-            self.parent_conn = _PopConnection()
-
-        #Push a new connection, start a new transaction
-        conn = _GetConnection()
-        _PushConnection(None)
-        _SetConnection(conn.new_transaction(options))
-
-        #Clear the context cache at the start of a transaction
-        caching.clear_context_cache()
-
-    def _finalize(self):
-        _PopConnection() #Pop the transaction connection
-        if self.parent_conn:
-            #If there was a parent transaction, now put that back
-            _PushConnection(self.parent_conn)
-            self.parent_conn = None
-
-        #Clear the context cache at the end of a transaction
-        caching.clear_context_cache()
+class ContextDecorator(object):
+    def __init__(self, func=None):
+        self.func = func
 
     def __call__(self, *args, **kwargs):
-        def call_func(*_args, **_kwargs):
-            try:
-                self._begin()
-                result = self.func(*_args, **_kwargs)
-                _GetConnection().commit()
-                return result
-            except:
-                conn = _GetConnection()
-                if conn:
-                    conn.rollback()
-                raise
-            finally:
-                self._finalize()
+        def decorated(*_args, **_kwargs):
+            with self:
+                return self.func(*_args, **_kwargs)
 
         if not self.func:
-            assert args and callable(args[0])
             self.func = args[0]
-            return call_func
+            return decorated
 
-        if self.func:
-            return call_func(*args, **kwargs)
+        return decorated(*args, **kwargs)
 
+class TransactionFailedError(Exception):
+    pass
+
+class AtomicDecorator(ContextDecorator):
+    def __init__(self, func=None, xg=False, independent=False, mandatory=False):
+        self.independent = independent
+        self.xg = xg
+        self.mandatory = mandatory
+        self.conn_stack = []
+        self.transaction_started = False
+        super(AtomicDecorator, self).__init__(func)
+
+    def _do_enter(self):
+        if IsInTransaction():
+            if self.independent:
+                self.conn_stack.append(_PopConnection())
+                try:
+                    return self._do_enter()
+                except:
+                    _PushConnection(self.conn_stack.pop())
+                    raise
+            else:
+                # App Engine doesn't support nested transactions, so if there is a nested
+                # atomic() call we just don't do anything. This is how RunInTransaction does it
+                return
+        elif self.mandatory:
+            raise TransactionFailedError("You've specified that an outer transaction is mandatory, but one doesn't exist")
+
+        options = CreateTransactionOptions(
+            xg=self.xg,
+            propagation=TransactionOptions.INDEPENDENT if self.independent else None
+        )
+
+        conn = _GetConnection()
+
+        self.transaction_started = True
+        new_conn = conn.new_transaction(options)
+
+        _PushConnection(None)
+        _SetConnection(new_conn)
+
+        assert(_GetConnection())
+
+        # Clear the context cache at the start of a transaction
+        caching._context.stack.push()
+
+    def _do_exit(self, exception):
+        if not self.transaction_started:
+            # If we didn't start a transaction, then don't roll back or anything
+            return
+
+        try:
+            if exception:
+                _GetConnection().rollback()
+            else:
+                if not _GetConnection().commit():
+                    raise TransactionFailedError()
+        finally:
+            _PopConnection()
+
+            if self.independent:
+                while self.conn_stack:
+                    _PushConnection(self.conn_stack.pop())
+
+                 # Clear the context cache at the end of a transaction
+                if exception:
+                    caching._context.stack.pop(discard=True)
+                else:
+                    caching._context.stack.pop(apply_staged=False, clear_staged=False)
+            else:
+                if exception:
+                    caching._context.stack.pop(discard=True)
+                else:
+                    caching._context.stack.pop(apply_staged=True, clear_staged=True)
 
     def __enter__(self):
-        self._begin()
+        self._do_enter()
 
-    def __exit__(self, *args, **kwargs):
-        if len(args) > 1 and isinstance(args[1], Exception):
-            _GetConnection().rollback() #If an exception happens, rollback
-        else:
-            _GetConnection().commit() #Otherwise commit
-
-        self._finalize()
-
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._do_exit(exc_type)
 
 atomic = AtomicDecorator
-commit_on_success = AtomicDecorator #Alias to the old Django name for this kinda thing
+commit_on_success = AtomicDecorator  # Alias to the old Django name for this kinda thing

@@ -1,6 +1,6 @@
 #LIBRARIES
 from django.db.models.sql import compiler
-#Following two ImportError blocks are for < 1.6 compatibility
+# Following two ImportError blocks are for < 1.6 compatibility
 try:
     from django.db.models.sql.compiler import SQLDateCompiler as DateCompiler
 except ImportError:
@@ -13,15 +13,13 @@ except ImportError:
         pass
 
 #DJANGAE
-from djangae.db.backends.appengine.query import Query
 from .commands import InsertCommand, SelectCommand, UpdateCommand, DeleteCommand
 
 
-
 class SQLCompiler(compiler.SQLCompiler):
-    query_class = Query
-
     def as_sql(self):
+        self.pre_sql_setup()
+        self.refcounts_before = self.query.alias_refcount.copy()
         select = SelectCommand(
             self.connection,
             self.query
@@ -35,11 +33,22 @@ class SQLInsertCompiler(compiler.SQLInsertCompiler, SQLCompiler):
         super(SQLInsertCompiler, self).__init__(*args, **kwargs)
 
     def as_sql(self):
-        return [ (InsertCommand(self.connection, self.query.model, self.query.objs, self.query.fields, self.query.raw), []) ]
+        self.pre_sql_setup()
+
+        from djangae.db.utils import get_concrete_fields
+
+        # Always pass down all the fields on an insert
+        return [ (InsertCommand(
+            self.connection, self.query.model, self.query.objs,
+            self.query.fields + get_concrete_fields(self.query.model, ignore_leaf=True),
+            self.query.raw), [])
+        ]
+
 
 class SQLDeleteCompiler(compiler.SQLDeleteCompiler, SQLCompiler):
     def as_sql(self):
         return (DeleteCommand(self.connection, self.query), [])
+
 
 class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):
 
@@ -47,8 +56,8 @@ class SQLUpdateCompiler(compiler.SQLUpdateCompiler, SQLCompiler):
         super(SQLUpdateCompiler, self).__init__(*args, **kwargs)
 
     def as_sql(self):
+        self.pre_sql_setup()
         return (UpdateCommand(self.connection, self.query), [])
-
 
 
 class SQLAggregateCompiler(compiler.SQLAggregateCompiler, SQLCompiler):
